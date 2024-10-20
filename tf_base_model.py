@@ -1,6 +1,7 @@
 from __future__ import print_function
 from collections import deque
 from datetime import datetime
+from importlib import reload
 import logging
 import os
 import pprint as pp
@@ -118,150 +119,155 @@ class TFBaseModel(object):
     def calculate_loss(self):
         raise NotImplementedError('subclass must implement this')
 
+    def init_fn(self):
+        self.global_step.assign(0)
+        self.learning_rate_var.assign(0.0)
+        self.beta1_decay_var.assign(0.0)
+        tf.compat.v1.global_variables_initializer()
+
     def fit(self):
-        with self.session.as_default():
+        if self.warm_start_init_step:
+            self.restore(self.warm_start_init_step)
+            step = self.warm_start_init_step
+        else:
+            step = 0
+            self.init_fn()
 
-            if self.warm_start_init_step:
-                self.restore(self.warm_start_init_step)
-                step = self.warm_start_init_step
-            else:
-                self.session.run(self.init)
-                step = 0
+        train_generator = self.reader.train_batch_generator(self.batch_size)
+        val_generator = self.reader.val_batch_generator(self.validation_batch_size)
 
-            train_generator = self.reader.train_batch_generator(self.batch_size)
-            val_generator = self.reader.val_batch_generator(self.validation_batch_size)
+        train_loss_history = deque(maxlen=self.loss_averaging_window)
+        val_loss_history = deque(maxlen=self.loss_averaging_window)
+        train_time_history = deque(maxlen=self.loss_averaging_window)
+        val_time_history = deque(maxlen=self.loss_averaging_window)
+        if not hasattr(self, 'metrics'):
+            self.metrics = {}
 
-            train_loss_history = deque(maxlen=self.loss_averaging_window)
-            val_loss_history = deque(maxlen=self.loss_averaging_window)
-            train_time_history = deque(maxlen=self.loss_averaging_window)
-            val_time_history = deque(maxlen=self.loss_averaging_window)
-            if not hasattr(self, 'metrics'):
-                self.metrics = {}
+        metric_histories = {
+            metric_name: deque(maxlen=self.loss_averaging_window) for metric_name in self.metrics
+        }
+        best_validation_loss, best_validation_tstep = float('inf'), 0
 
-            metric_histories = {
-                metric_name: deque(maxlen=self.loss_averaging_window) for metric_name in self.metrics
+        while step < self.num_training_steps:
+
+            # validation evaluation
+            val_start = time.time()
+            val_batch_df = next(val_generator)
+            val_feed_dict = {
+                getattr(self, placeholder_name, None): data
+                for placeholder_name, data in val_batch_df.items() if hasattr(self, placeholder_name)
             }
-            best_validation_loss, best_validation_tstep = float('inf'), 0
 
-            while step < self.num_training_steps:
+            val_feed_dict.update({self.learning_rate_var: self.learning_rate, self.beta1_decay_var: self.beta1_decay})
+            if hasattr(self, 'keep_prob'):
+                val_feed_dict.update({self.keep_prob: 1.0})
+            if hasattr(self, 'is_training'):
+                val_feed_dict.update({self.is_training: False})
 
-                # validation evaluation
-                val_start = time.time()
-                val_batch_df = next(val_generator)
-                val_feed_dict = {
-                    getattr(self, placeholder_name, None): data
-                    for placeholder_name, data in val_batch_df.items() if hasattr(self, placeholder_name)
-                }
+            results = self.session.run(
+                fetches=[self.loss] + self.metrics.values(),
+                feed_dict=val_feed_dict
+            )
+            val_loss = results[0]
+            val_metrics = results[1:] if len(results) > 1 else []
+            val_metrics = dict(zip(self.metrics.keys(), val_metrics))
+            val_loss_history.append(val_loss)
+            val_time_history.append(time.time() - val_start)
+            for key in val_metrics:
+                metric_histories[key].append(val_metrics[key])
 
-                val_feed_dict.update({self.learning_rate_var: self.learning_rate, self.beta1_decay_var: self.beta1_decay})
-                if hasattr(self, 'keep_prob'):
-                    val_feed_dict.update({self.keep_prob: 1.0})
-                if hasattr(self, 'is_training'):
-                    val_feed_dict.update({self.is_training: False})
-
-                results = self.session.run(
-                    fetches=[self.loss] + self.metrics.values(),
-                    feed_dict=val_feed_dict
-                )
-                val_loss = results[0]
-                val_metrics = results[1:] if len(results) > 1 else []
-                val_metrics = dict(zip(self.metrics.keys(), val_metrics))
-                val_loss_history.append(val_loss)
-                val_time_history.append(time.time() - val_start)
-                for key in val_metrics:
-                    metric_histories[key].append(val_metrics[key])
-
-                if hasattr(self, 'monitor_tensors'):
-                    for name, tensor in self.monitor_tensors.items():
-                        [np_val] = self.session.run([tensor], feed_dict=val_feed_dict)
-                        print(name)
-                        print('min', np_val.min())
-                        print('max', np_val.max())
-                        print('mean', np_val.mean())
-                        print('std', np_val.std())
-                        print('nans', np.isnan(np_val).sum())
-                        print()
+            if hasattr(self, 'monitor_tensors'):
+                for name, tensor in self.monitor_tensors.items():
+                    [np_val] = self.session.run([tensor], feed_dict=val_feed_dict)
+                    print(name)
+                    print('min', np_val.min())
+                    print('max', np_val.max())
+                    print('mean', np_val.mean())
+                    print('std', np_val.std())
+                    print('nans', np.isnan(np_val).sum())
                     print()
-                    print()
+                print()
+                print()
 
-                # train step
-                train_start = time.time()
-                train_batch_df = next(train_generator)
-                train_feed_dict = {
-                    getattr(self, placeholder_name, None): data
-                    for placeholder_name, data in train_batch_df.items() if hasattr(self, placeholder_name)
-                }
+            # train step
+            train_start = time.time()
+            train_batch_df = next(train_generator)
+            train_feed_dict = {
+                getattr(self, placeholder_name, None): data
+                for placeholder_name, data in train_batch_df.items() if hasattr(self, placeholder_name)
+            }
 
-                train_feed_dict.update({self.learning_rate_var: self.learning_rate, self.beta1_decay_var: self.beta1_decay})
-                if hasattr(self, 'keep_prob'):
-                    train_feed_dict.update({self.keep_prob: self.keep_prob_scalar})
-                if hasattr(self, 'is_training'):
-                    train_feed_dict.update({self.is_training: True})
+            train_feed_dict.update({self.learning_rate_var: self.learning_rate, self.beta1_decay_var: self.beta1_decay})
+            if hasattr(self, 'keep_prob'):
+                train_feed_dict.update({self.keep_prob: self.keep_prob_scalar})
+            if hasattr(self, 'is_training'):
+                train_feed_dict.update({self.is_training: True})
 
-                train_loss, _ = self.session.run(
-                    fetches=[self.loss, self.step],
-                    feed_dict=train_feed_dict
+            with tf.GradientTape() as tape:
+                loss = self.calculate_loss()
+                grads = tape.gradient(loss, self.trainable_variables)
+                self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
+            train_loss_history.append(loss)
+            train_time_history.append(time.time() - train_start)
+
+            if step % self.log_interval == 0:
+                avg_train_loss = sum(train_loss_history) / len(train_loss_history)
+                avg_val_loss = sum(val_loss_history) / len(val_loss_history)
+                avg_train_time = sum(train_time_history) / len(train_time_history)
+                avg_val_time = sum(val_time_history) / len(val_time_history)
+                metric_log = (
+                    "[[step {:>8}]]     "
+                    "[[train {:>4}s]]     loss: {:<12}     "
+                    "[[val {:>4}s]]     loss: {:<12}     "
+                ).format(
+                    step,
+                    round(avg_train_time, 4),
+                    round(avg_train_loss, 8),
+                    round(avg_val_time, 4),
+                    round(avg_val_loss, 8),
                 )
-                train_loss_history.append(train_loss)
-                train_time_history.append(time.time() - train_start)
+                early_stopping_metric = avg_val_loss
+                for metric_name, metric_history in metric_histories.items():
+                    metric_val = sum(metric_history) / len(metric_history)
+                    metric_log += '{}: {:<4}     '.format(metric_name, round(metric_val, 4))
+                    if metric_name == self.early_stopping_metric:
+                        early_stopping_metric = metric_val
 
-                if step % self.log_interval == 0:
-                    avg_train_loss = sum(train_loss_history) / len(train_loss_history)
-                    avg_val_loss = sum(val_loss_history) / len(val_loss_history)
-                    avg_train_time = sum(train_time_history) / len(train_time_history)
-                    avg_val_time = sum(val_time_history) / len(val_time_history)
-                    metric_log = (
-                        "[[step {:>8}]]     "
-                        "[[train {:>4}s]]     loss: {:<12}     "
-                        "[[val {:>4}s]]     loss: {:<12}     "
-                    ).format(
-                        step,
-                        round(avg_train_time, 4),
-                        round(avg_train_loss, 8),
-                        round(avg_val_time, 4),
-                        round(avg_val_loss, 8),
-                    )
-                    early_stopping_metric = avg_val_loss
-                    for metric_name, metric_history in metric_histories.items():
-                        metric_val = sum(metric_history) / len(metric_history)
-                        metric_log += '{}: {:<4}     '.format(metric_name, round(metric_val, 4))
-                        if metric_name == self.early_stopping_metric:
-                            early_stopping_metric = metric_val
+                logging.info(metric_log)
 
-                    logging.info(metric_log)
+                if early_stopping_metric < best_validation_loss:
+                    best_validation_loss = early_stopping_metric
+                    best_validation_tstep = step
+                    if step > self.min_steps_to_checkpoint:
+                        self.save(step)
+                        if self.enable_parameter_averaging:
+                            self.save(step, averaged=True)
 
-                    if early_stopping_metric < best_validation_loss:
-                        best_validation_loss = early_stopping_metric
-                        best_validation_tstep = step
-                        if step > self.min_steps_to_checkpoint:
-                            self.save(step)
-                            if self.enable_parameter_averaging:
-                                self.save(step, averaged=True)
+                if step - best_validation_tstep > self.early_stopping_steps:
 
-                    if step - best_validation_tstep > self.early_stopping_steps:
+                    if self.num_restarts is None or self.restart_idx >= self.num_restarts:
+                        logging.info('best validation loss of {} at training step {}'.format(
+                            best_validation_loss, best_validation_tstep))
+                        logging.info('early stopping - ending training.')
+                        return
 
-                        if self.num_restarts is None or self.restart_idx >= self.num_restarts:
-                            logging.info('best validation loss of {} at training step {}'.format(
-                                best_validation_loss, best_validation_tstep))
-                            logging.info('early stopping - ending training.')
-                            return
+                    if self.restart_idx < self.num_restarts:
+                        self.restore(best_validation_tstep)
+                        step = best_validation_tstep
+                        self.restart_idx += 1
+                        self.update_train_params()
+                        train_generator = self.reader.train_batch_generator(self.batch_size)
 
-                        if self.restart_idx < self.num_restarts:
-                            self.restore(best_validation_tstep)
-                            step = best_validation_tstep
-                            self.restart_idx += 1
-                            self.update_train_params()
-                            train_generator = self.reader.train_batch_generator(self.batch_size)
+            step += 1
 
-                step += 1
+        if step <= self.min_steps_to_checkpoint:
+            best_validation_tstep = step
+            self.save(step)
+            if self.enable_parameter_averaging:
+                self.save(step, averaged=True)
 
-            if step <= self.min_steps_to_checkpoint:
-                best_validation_tstep = step
-                self.save(step)
-                if self.enable_parameter_averaging:
-                    self.save(step, averaged=True)
-
-            logging.info('num_training_steps reached - ending training')
+        logging.info('num_training_steps reached - ending training')
 
     def predict(self, chunk_size=256):
         if not os.path.isdir(self.prediction_dir):
@@ -381,7 +387,7 @@ class TFBaseModel(object):
 
     def get_optimizer(self, learning_rate, beta1_decay):
         if self.optimizer == 'adam':
-            return tf.train.AdamOptimizer(learning_rate, beta1=beta1_decay)
+            return tf.keras.optimizers.Adam(learning_rate=learning_rate, beta_1=beta1_decay)
         elif self.optimizer == 'gd':
             return tf.train.GradientDescentOptimizer(learning_rate)
         elif self.optimizer == 'rms':
@@ -403,5 +409,4 @@ class TFBaseModel(object):
             if self.enable_parameter_averaging:
                 self.saver_averaged = tf.train.Saver(self.ema.variables_to_restore(), max_to_keep=1)
 
-            self.init = tf.global_variables_initializer()
             return graph
