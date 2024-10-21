@@ -69,7 +69,7 @@ class DataReader(object):
             yield batch
 
 
-class rnn(TFBaseModel):
+class RNN(TFBaseModel):
 
     def __init__(
         self,
@@ -82,7 +82,7 @@ class rnn(TFBaseModel):
         self.output_mixture_components = output_mixture_components
         self.output_units = self.output_mixture_components*6 + 1
         self.attention_mixture_components = attention_mixture_components
-        super(rnn, self).__init__(**kwargs)
+        super(RNN, self).__init__(**kwargs)
 
     def parse_parameters(self, z, eps=1e-8, sigma_eps=1e-4):
         pis, sigmas, rhos, mus, es = tf.split(
@@ -119,10 +119,10 @@ class rnn(TFBaseModel):
 
         bernoulli_likelihood = tf.squeeze(tf.where(tf.equal(tf.ones_like(y_3), y_3), es, 1 - es))
 
-        nll = -(tf.log(gmm_likelihood) + tf.log(bernoulli_likelihood))
+        nll = -(tf.math.log(gmm_likelihood) + tf.math.log(bernoulli_likelihood))
         sequence_mask = tf.logical_and(
             tf.sequence_mask(lengths, maxlen=tf.shape(y)[1]),
-            tf.logical_not(tf.is_nan(nll)),
+            tf.logical_not(tf.math.is_nan(nll)),
         )
         nll = tf.where(sequence_mask, nll, tf.zeros_like(nll))
         num_valid = tf.reduce_sum(tf.cast(sequence_mask, tf.float32), axis=1)
@@ -132,7 +132,7 @@ class rnn(TFBaseModel):
         return sequence_loss, element_loss
 
     def sample(self, cell):
-        initial_state = cell.zero_state(self.num_samples, dtype=tf.float32)
+        initial_state = cell.get_initial_state(batch_size=self.num_samples, dtype=tf.float32)
         initial_input = tf.concat([
             tf.zeros([self.num_samples, 2]),
             tf.ones([self.num_samples, 1]),
@@ -146,15 +146,13 @@ class rnn(TFBaseModel):
         )[1]
 
     def primed_sample(self, cell):
-        initial_state = cell.zero_state(self.num_samples, dtype=tf.float32)
-        primed_state = tf.nn.dynamic_rnn(
-            inputs=self.x_prime,
+        initial_state = cell.get_initial_state(batch_size=self.num_samples, dtype=tf.float32)
+        primed_state = tf.keras.layers.RNN(
             cell=cell,
+            inputs=self.x_prime,
             sequence_length=self.x_prime_len,
-            dtype=tf.float32,
-            initial_state=initial_state,
-            scope='rnn'
-        )[1]
+            initial_state=initial_state
+        )
         return rnn_free_run(
             cell=cell,
             sequence_length=self.sample_tsteps,
@@ -163,19 +161,18 @@ class rnn(TFBaseModel):
         )[1]
 
     def calculate_loss(self):
-        self.x = tf.placeholder(tf.float32, [None, None, 3])
-        self.y = tf.placeholder(tf.float32, [None, None, 3])
-        self.x_len = tf.placeholder(tf.int32, [None])
-        self.c = tf.placeholder(tf.int32, [None, None])
-        self.c_len = tf.placeholder(tf.int32, [None])
+        self.x = tf.keras.Input(shape=(None, 3), dtype=tf.float32)
+        self.y = tf.keras.Input(shape=(None, 3), dtype=tf.float32)
+        self.x_len = tf.keras.Input(shape=(), dtype=tf.int32)
+        self.c = tf.keras.Input(shape=(None,), dtype=tf.int32)
+        self.c_len = tf.keras.Input(shape=(), dtype=tf.int32)
 
-        self.sample_tsteps = tf.placeholder(tf.int32, [])
-        self.num_samples = tf.placeholder(tf.int32, [])
-        self.prime = tf.placeholder(tf.bool, [])
-        self.x_prime = tf.placeholder(tf.float32, [None, None, 3])
-        self.x_prime_len = tf.placeholder(tf.int32, [None])
-        self.bias = tf.placeholder_with_default(
-            tf.zeros([self.num_samples], dtype=tf.float32), [None])
+        self.sample_tsteps = tf.keras.Input(shape=(), dtype=tf.int32)
+        self.num_samples = tf.keras.Input(shape=(), dtype=tf.int32)
+        self.prime = tf.keras.Input(shape=(), dtype=tf.bool)
+        self.x_prime = tf.keras.Input(shape=(None, 3), dtype=tf.float32)
+        self.x_prime_len = tf.keras.Input(shape=(), dtype=tf.int32)
+        self.bias = tf.keras.Input(shape=(), dtype=tf.float32)
 
         cell = LSTMAttentionCell(
             lstm_size=self.lstm_size,
@@ -185,16 +182,15 @@ class rnn(TFBaseModel):
             num_output_mixture_components=self.output_mixture_components,
             bias=self.bias
         )
-        self.initial_state = cell.zero_state(tf.shape(self.x)[0], dtype=tf.float32)
-        outputs, self.final_state = tf.nn.dynamic_rnn(
-            inputs=self.x,
+
+        self.initial_state = cell.get_initial_state(batch_size=tf.shape(self.x)[0], dtype=tf.float32)
+        outputs, self.final_state = tf.keras.layers.RNN(
             cell=cell,
+            inputs=self.x,
             sequence_length=self.x_len,
-            dtype=tf.float32,
             initial_state=self.initial_state,
-            scope='rnn'
         )
-        params = time_distributed_dense_layer(outputs, self.output_units, scope='rnn/gmm')
+        params = time_distributed_dense_layer(outputs, self.output_units)
         pis, mus, sigmas, rhos, es = self.parse_parameters(params)
         sequence_loss, self.loss = self.NLL(self.y, self.x_len, pis, mus, sigmas, rhos, es)
 
@@ -209,7 +205,7 @@ class rnn(TFBaseModel):
 if __name__ == '__main__':
     dr = DataReader(data_dir='data/processed/')
 
-    nn = rnn(
+    nn = RNN(
         reader=dr,
         log_dir='logs',
         checkpoint_dir='checkpoints',
