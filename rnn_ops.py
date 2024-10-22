@@ -1,9 +1,3 @@
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import variable_scope as vs
-from tensorflow.python.ops.rnn_cell_impl import _concat, _like_rnncell
-
 
 import tensorflow as tf
 
@@ -18,13 +12,13 @@ def raw_rnn(cell, loop_fn, parallel_iterations=None, swap_memory=False, scope=No
 
     parallel_iterations = parallel_iterations or 32
 
-    time = tf.constant(0, dtype=dtypes.int32)
+    time = tf.constant(0, dtype=tf.dtypes.int32)
     elements_finished, next_input, initial_state, emit_structure, init_loop_state = loop_fn(time, None, None, None)
     
     flat_input = tf.nest.flatten(next_input)
 
     # Need a surrogate loop state for the while_loop if none is available.
-    loop_state = init_loop_state if init_loop_state is not None else tf.constant(0, dtype=dtypes.int32)
+    loop_state = init_loop_state if init_loop_state is not None else tf.constant(0, dtype=tf.dtypes.int32)
 
     # Check for batch size
     input_shape = [input_.shape() for input_ in flat_input]
@@ -129,7 +123,7 @@ def raw_rnn(cell, loop_fn, parallel_iterations=None, swap_memory=False, scope=No
         return (next_time, elements_finished, next_input, state_ta,
                 emit_ta, next_state, loop_state)
 
-    returned = control_flow_ops.while_loop(
+    returned = tf.while_loop(
         condition, body, loop_vars=[
             time, elements_finished, next_input, state_ta,
             emit_ta, state, loop_state],
@@ -156,7 +150,7 @@ def rnn_teacher_force(inputs, cell, sequence_length, initial_state, scope='dynam
     Used in the same way as tf.dynamic_rnn.
     """
     inputs = tf.transpose(inputs, (1, 0, 2))
-    inputs_ta = tf.TensorArray(dtype=dtypes.float32, size=array_ops.shape(inputs)[0])
+    inputs_ta = tf.TensorArray(dtype=tf.dtypes.float32, size=tf.shape(inputs)[0])
     inputs_ta = inputs_ta.unstack(inputs)
 
     def loop_fn(time, cell_output, cell_state, loop_state):
@@ -166,9 +160,9 @@ def rnn_teacher_force(inputs, cell, sequence_length, initial_state, scope='dynam
         elements_finished = time >= sequence_length
         finished = tf.reduce_all(elements_finished)
 
-        next_input = control_flow_ops.cond(
+        next_input = tf.cond(
             finished,
-            lambda: tf.zeros([tf.shape(inputs)[1], inputs.shape.as_list()[2]], dtype=dtypes.float32),
+            lambda: tf.zeros([tf.shape(inputs)[1], inputs.shape.as_list()[2]], dtype=tf.dtypes.float32),
             lambda: inputs_ta.read(time)
         )
 
@@ -191,7 +185,7 @@ def rnn_free_run(cell, initial_state, sequence_length, initial_input=None, scope
         cell.termination_condition(state) which returns a boolean tensor of shape
         [batch_size] denoting which sequences no longer need to be sampled.
     """
-    with vs.variable_scope(scope, reuse=True):
+    with tf.variable_scope(scope, reuse=True):
         if initial_input is None:
             initial_input = cell.output_function(initial_state)
 
@@ -204,7 +198,7 @@ def rnn_free_run(cell, initial_state, sequence_length, initial_input=None, scope
         )
         finished = tf.reduce_all(elements_finished)
 
-        next_input = control_flow_ops.cond(
+        next_input = tf.cond(
             finished,
             lambda: tf.zeros_like(initial_input),
             lambda: initial_input if cell_output is None else cell.output_function(next_cell_state)
